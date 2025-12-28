@@ -1,8 +1,8 @@
 """3-stage LLM Council orchestration."""
 
 from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from llm_router import Message
+from .config import router, COUNCIL_MODELS, CHAIRMAN_MODEL, TITLE_GENERATION_MODEL
 
 
 async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
@@ -15,18 +15,18 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
     Returns:
         List of dicts with 'model' and 'response' keys
     """
-    messages = [{"role": "user", "content": user_query}]
+    messages = [Message(role="user", content=user_query)]
 
     # Query all models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    responses = await router.complete_many(COUNCIL_MODELS, messages)
 
     # Format results
     stage1_results = []
     for model, response in responses.items():
-        if response is not None:  # Only include successful responses
+        if not isinstance(response, Exception):
             stage1_results.append({
                 "model": model,
-                "response": response.get('content', '')
+                "response": response.content
             })
 
     return stage1_results
@@ -92,16 +92,16 @@ FINAL RANKING:
 
 Now provide your evaluation and ranking:"""
 
-    messages = [{"role": "user", "content": ranking_prompt}]
+    messages = [Message(role="user", content=ranking_prompt)]
 
     # Get rankings from all council models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    responses = await router.complete_many(COUNCIL_MODELS, messages)
 
     # Format results
     stage2_results = []
     for model, response in responses.items():
-        if response is not None:
-            full_text = response.get('content', '')
+        if not isinstance(response, Exception):
+            full_text = response.content
             parsed = parse_ranking_from_text(full_text)
             stage2_results.append({
                 "model": model,
@@ -156,22 +156,20 @@ Your task as Chairman is to synthesize all of this information into a single, co
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
 
-    messages = [{"role": "user", "content": chairman_prompt}]
+    messages = [Message(role="user", content=chairman_prompt)]
 
     # Query the chairman model
-    response = await query_model(CHAIRMAN_MODEL, messages)
-
-    if response is None:
-        # Fallback if chairman fails
+    try:
+        response = await router.complete(CHAIRMAN_MODEL, messages)
+        return {
+            "model": CHAIRMAN_MODEL,
+            "response": response.content
+        }
+    except Exception:
         return {
             "model": CHAIRMAN_MODEL,
             "response": "Error: Unable to generate final synthesis."
         }
-
-    return {
-        "model": CHAIRMAN_MODEL,
-        "response": response.get('content', '')
-    }
 
 
 def parse_ranking_from_text(ranking_text: str) -> List[str]:
@@ -272,25 +270,16 @@ Question: {user_query}
 
 Title:"""
 
-    messages = [{"role": "user", "content": title_prompt}]
+    messages = [Message(role="user", content=title_prompt)]
 
-    # Use gemini-2.5-flash for title generation (fast and cheap)
-    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
-
-    if response is None:
-        # Fallback to a generic title
+    try:
+        response = await router.complete(TITLE_GENERATION_MODEL, messages, max_tokens=30)
+        title = response.content.strip().strip('"\'')
+        if len(title) > 50:
+            title = title[:47] + "..."
+        return title
+    except Exception:
         return "New Conversation"
-
-    title = response.get('content', 'New Conversation').strip()
-
-    # Clean up the title - remove quotes, limit length
-    title = title.strip('"\'')
-
-    # Truncate if too long
-    if len(title) > 50:
-        title = title[:47] + "..."
-
-    return title
 
 
 async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
